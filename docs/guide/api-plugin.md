@@ -332,7 +332,7 @@ Vite plugins can also provide hooks that serve Vite-specific purposes. These hoo
 - **Type:** `IndexHtmlTransformHook | { enforce?: 'pre' | 'post', transform: IndexHtmlTransformHook }`
 - **Kind:** `async`, `sequential`
 
-  Dedicated hook for transforming `index.html`. The hook receives the current HTML string and a transform context. The context exposes the [`ViteDevServer`](./api-javascript#vitedevserver) instance during dev, and exposes the Rollup output bundle during build.
+  Dedicated hook for transforming HTML entry point files such as `index.html`. The hook receives the current HTML string and a transform context. The context exposes the [`ViteDevServer`](./api-javascript#vitedevserver) instance during dev, and exposes the Rollup output bundle during build.
 
   The hook can be async and can return one of the following:
 
@@ -517,6 +517,10 @@ normalizePath('foo\\bar') // 'foo/bar'
 normalizePath('foo/bar') // 'foo/bar'
 ```
 
+## Filtering, include/exclude pattern
+
+Vite exposes [`@rollup/pluginutils`'s `createFilter`](https://github.com/rollup/plugins/tree/master/packages/pluginutils#createfilter) function to encourage Vite specific plugins and integrations to use the standard include/exclude filtering pattern, which is also used in Vite core itself.
+
 ## Client-server Communication
 
 Since Vite 2.9, we provide some utilities for plugins to help handle the communication with clients.
@@ -540,7 +544,7 @@ export default defineConfig({
 ```
 
 ::: tip NOTE
-We recommend **alway prefixing** your event names to avoid collisions with other plugins.
+We recommend **always prefixing** your event names to avoid collisions with other plugins.
 :::
 
 On the client side, use [`hot.on`](/guide/api-hmr.html#hot-on-event-cb) to listen to the events:

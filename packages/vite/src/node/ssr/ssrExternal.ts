@@ -1,12 +1,12 @@
-import fs from 'fs'
-import path from 'path'
-import { createRequire } from 'module'
-import { createFilter } from '@rollup/pluginutils'
+import fs from 'node:fs'
+import path from 'node:path'
+import { createRequire } from 'node:module'
 import type { InternalResolveOptions } from '../plugins/resolve'
 import { tryNodeResolve } from '../plugins/resolve'
 import {
   bareImportRE,
   createDebugger,
+  createFilter,
   isBuiltin,
   isDefined,
   lookupFile,
@@ -105,20 +105,17 @@ export function shouldExternalizeForSSR(
   return isSsrExternal(id)
 }
 
-function createIsSsrExternal(
+export function createIsConfiguredAsSsrExternal(
   config: ResolvedConfig
-): (id: string) => boolean | undefined {
-  const processedIds = new Map<string, boolean | undefined>()
-
-  const { ssr, root } = config
-
+): (id: string) => boolean {
+  const { ssr } = config
   const noExternal = ssr?.noExternal
   const noExternalFilter =
     noExternal !== 'undefined' &&
     typeof noExternal !== 'boolean' &&
     createFilter(undefined, noExternal, { resolve: false })
 
-  const isConfiguredAsExternal = (id: string) => {
+  return (id: string) => {
     const { ssr } = config
     if (!ssr || ssr.external?.includes(id)) {
       return true
@@ -131,6 +128,16 @@ function createIsSsrExternal(
     }
     return true
   }
+}
+
+function createIsSsrExternal(
+  config: ResolvedConfig
+): (id: string) => boolean | undefined {
+  const processedIds = new Map<string, boolean | undefined>()
+
+  const { ssr, root } = config
+
+  const isConfiguredAsExternal = createIsConfiguredAsSsrExternal(config)
 
   const resolveOptions: InternalResolveOptions = {
     root,
@@ -167,8 +174,8 @@ function createIsSsrExternal(
   }
 }
 
-// When ssr.format is 'cjs', this function is used reverting to the Vite 2.9
-// SSR externalization heuristics
+// When config.experimental.buildSsrCjsExternalHeuristics is enabled, this function
+// is used reverting to the Vite 2.9 SSR externalization heuristics
 function cjsSsrCollectExternals(
   root: string,
   preserveSymlinks: boolean | undefined,

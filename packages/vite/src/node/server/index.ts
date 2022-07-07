@@ -1,8 +1,8 @@
-import fs from 'fs'
-import path from 'path'
-import type * as net from 'net'
-import type * as http from 'http'
-import { performance } from 'perf_hooks'
+import fs from 'node:fs'
+import path from 'node:path'
+import type * as net from 'node:net'
+import type * as http from 'node:http'
+import { performance } from 'node:perf_hooks'
 import connect from 'connect'
 import corsMiddleware from 'cors'
 import colors from 'picocolors'
@@ -28,7 +28,11 @@ import {
   ssrRewriteStacktrace
 } from '../ssr/ssrStacktrace'
 import { ssrTransform } from '../ssr/ssrTransform'
-import { getDepsOptimizer, initDepsOptimizer } from '../optimizer'
+import {
+  getDepsOptimizer,
+  initDepsOptimizer,
+  initDevSsrDepsOptimizer
+} from '../optimizer'
 import { CLIENT_DIR } from '../constants'
 import type { Logger } from '../logger'
 import { printCommonServerUrls } from '../logger'
@@ -96,10 +100,18 @@ export interface ServerOptions extends CommonServerOptions {
    * @default true
    */
   preTransformRequests?: boolean
+  /**
+   * Force dep pre-optimization regardless of whether deps have changed.
+   *
+   * @deprecated Use optimizeDeps.force instead, this option may be removed
+   * in a future minor version without following semver
+   */
+  force?: boolean
 }
 
 export interface ResolvedServerOptions extends ServerOptions {
   fs: Required<FileSystemServeOptions>
+  middlewareMode: boolean
 }
 
 export interface FileSystemServeOptions {
@@ -222,7 +234,7 @@ export interface ViteDevServer {
   /**
    * Print server urls
    */
-  printUrls(): void
+  printUrls(): Promise<void>
   /**
    * Restart the server.
    *
@@ -268,10 +280,7 @@ export async function createServer(
     config.server.https,
     config.cacheDir
   )
-  let { middlewareMode } = serverConfig
-  if (middlewareMode === true) {
-    middlewareMode = 'ssr'
-  }
+  const { middlewareMode } = serverConfig
 
   const middlewares = connect() as Connect.Server
   const httpServer = middlewareMode
@@ -282,8 +291,9 @@ export async function createServer(
   const { ignored = [], ...watchOptions } = serverConfig.watch || {}
   const watcher = chokidar.watch(path.resolve(root), {
     ignored: [
-      '**/node_modules/**',
       '**/.git/**',
+      '**/node_modules/**',
+      '**/test-results/**', // Playwright
       ...(Array.isArray(ignored) ? ignored : [ignored])
     ],
     ignoreInitial: true,
@@ -319,6 +329,9 @@ export async function createServer(
     },
     transformIndexHtml: null!, // to be immediately set
     async ssrLoadModule(url, opts?: { fixStacktrace?: boolean }) {
+      if (isDepsOptimizerEnabled(config, true)) {
+        await initDevSsrDepsOptimizer(config, server)
+      }
       await updateCjsSsrExternals(server)
       return ssrLoadModule(
         url,
@@ -355,9 +368,9 @@ export async function createServer(
         closeHttpServer()
       ])
     },
-    printUrls() {
+    async printUrls() {
       if (httpServer) {
-        printCommonServerUrls(httpServer, config.server, config)
+        await printCommonServerUrls(httpServer, config.server, config)
       } else {
         throw new Error('cannot print server URLs in middleware mode.')
       }
@@ -466,7 +479,8 @@ export async function createServer(
   }
 
   // base
-  if (config.base !== '/') {
+  const devBase = config.base
+  if (devBase !== '/') {
     middlewares.use(baseMiddleware(server))
   }
 
@@ -489,10 +503,8 @@ export async function createServer(
   middlewares.use(serveRawFsMiddleware(server))
   middlewares.use(serveStaticMiddleware(root, server))
 
-  const isMiddlewareMode = middlewareMode && middlewareMode !== 'html'
-
   // spa fallback
-  if (config.spa && !isMiddlewareMode) {
+  if (config.appType === 'spa') {
     middlewares.use(spaFallbackMiddleware(root))
   }
 
@@ -501,12 +513,10 @@ export async function createServer(
   // serve custom content instead of index.html.
   postHooks.forEach((fn) => fn && fn())
 
-  if (config.spa && !isMiddlewareMode) {
+  if (config.appType === 'spa' || config.appType === 'mpa') {
     // transform index.html
     middlewares.use(indexHtmlMiddleware(server))
-  }
 
-  if (!isMiddlewareMode) {
     // handle 404s
     // Keep the named function. The name is visible in debug logs via `DEBUG=connect:dispatcher ...`
     middlewares.use(function vite404Middleware(_, res) {
@@ -516,34 +526,43 @@ export async function createServer(
   }
 
   // error handler
-  middlewares.use(errorMiddleware(server, !!middlewareMode))
+  middlewares.use(errorMiddleware(server, middlewareMode))
 
-  const initOptimizer = async () => {
-    if (isDepsOptimizerEnabled(config)) {
-      await initDepsOptimizer(config, server)
+  let initingServer: Promise<void> | undefined
+  let serverInited = false
+  const initServer = async () => {
+    if (serverInited) {
+      return
     }
+    if (initingServer) {
+      return initingServer
+    }
+    initingServer = (async function () {
+      await container.buildStart({})
+      if (isDepsOptimizerEnabled(config, false)) {
+        // non-ssr
+        await initDepsOptimizer(config, server)
+      }
+      initingServer = undefined
+      serverInited = true
+    })()
+    return initingServer
   }
 
   if (!middlewareMode && httpServer) {
-    let isOptimized = false
     // overwrite listen to init optimizer before server start
     const listen = httpServer.listen.bind(httpServer)
     httpServer.listen = (async (port: number, ...args: any[]) => {
-      if (!isOptimized) {
-        try {
-          await container.buildStart({})
-          await initOptimizer()
-          isOptimized = true
-        } catch (e) {
-          httpServer.emit('error', e)
-          return
-        }
+      try {
+        await initServer()
+      } catch (e) {
+        httpServer.emit('error', e)
+        return
       }
       return listen(port, ...args)
     }) as any
   } else {
-    await container.buildStart({})
-    await initOptimizer()
+    await initServer()
   }
 
   return server
@@ -561,11 +580,11 @@ async function startServer(
 
   const options = server.config.server
   const port = inlinePort ?? options.port ?? 5173
-  const hostname = resolveHostname(options.host)
+  const hostname = await resolveHostname(options.host)
 
   const protocol = options.https ? 'https' : 'http'
   const info = server.config.logger.info
-  const base = server.config.base
+  const devBase = server.config.base
 
   const serverPort = await httpServerStart(httpServer, {
     port,
@@ -594,7 +613,7 @@ async function startServer(
   }
 
   if (options.open && !isRestart) {
-    const path = typeof options.open === 'string' ? options.open : base
+    const path = typeof options.open === 'string' ? options.open : devBase
     openBrowser(
       path.startsWith('http')
         ? path
@@ -654,7 +673,8 @@ export function resolveServerOptions(
 ): ResolvedServerOptions {
   const server: ResolvedServerOptions = {
     preTransformRequests: true,
-    ...(raw as ResolvedServerOptions)
+    ...(raw as ResolvedServerOptions),
+    middlewareMode: !!raw?.middlewareMode
   }
   let allowDirs = server.fs?.allow
   const deny = server.fs?.deny || ['.env', '.env.*', '*.{crt,pem}']
@@ -701,7 +721,7 @@ async function restartServer(server: ViteDevServer) {
   let inlineConfig = server.config.inlineConfig
   if (server._forceOptimizeOnRestart) {
     inlineConfig = mergeConfig(inlineConfig, {
-      server: {
+      optimizeDeps: {
         force: true
       }
     })
@@ -722,7 +742,7 @@ async function restartServer(server: ViteDevServer) {
       // prevent new server `restart` function from calling
       // @ts-ignore
       newServer[key] = server[key]
-    } else if (key !== 'app') {
+    } else {
       // @ts-ignore
       server[key] = newServer[key]
     }
@@ -750,7 +770,15 @@ async function restartServer(server: ViteDevServer) {
 async function updateCjsSsrExternals(server: ViteDevServer) {
   if (!server._ssrExternals) {
     let knownImports: string[] = []
-    const depsOptimizer = getDepsOptimizer(server.config)
+
+    // Important! We use the non-ssr optimized deps to find known imports
+    // Only the explicitly defined deps are optimized during dev SSR, so
+    // we use the generated list from the scanned deps in regular dev.
+    // This is part of the v2 externalization heuristics and it is kept
+    // for backwards compatibility in case user needs to fallback to the
+    // legacy scheme. It may be removed in a future v3 minor.
+    const depsOptimizer = getDepsOptimizer(server.config, false) // non-ssr
+
     if (depsOptimizer) {
       await depsOptimizer.scanProcessing
       knownImports = [
